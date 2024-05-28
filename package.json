@@ -46,5 +46,9 @@
       "deno fmt",
       "git add"
     ]
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "uuid": "^9.0.1"
   }
 }

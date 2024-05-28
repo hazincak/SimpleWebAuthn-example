@@ -42,6 +42,11 @@ import { LoggedInUser } from './example-server';
 
 const app = express();
 const MemoryStore = memoryStore(session);
+import {v4 as uuidv4} from "uuid"
+import base64url from "base64url";
+import { Base64URLString } from '@simplewebauthn/server/script/deps';
+
+var cors = require('cors');
 
 const {
   ENABLE_CONFORMANCE,
@@ -51,6 +56,7 @@ const {
 
 app.use(express.static('./public/'));
 app.use(express.json());
+app.use(cors());
 app.use(
   session({
     secret: 'secret123',
@@ -98,9 +104,9 @@ export let expectedOrigin = '';
  *
  * Here, the example server assumes the following user has completed login:
  */
-const loggedInUserId = 'internalUserId';
+let loggedInUserId = 'internalUserId';
 
-const inMemoryUserDeviceDB: { [loggedInUserId: string]: LoggedInUser } = {
+const inMemoryUserDeviceDB: { [loggedInUserId: string]: any } = {
   [loggedInUserId]: {
     id: loggedInUserId,
     username: `user@${rpID}`,
@@ -112,6 +118,14 @@ const inMemoryUserDeviceDB: { [loggedInUserId: string]: LoggedInUser } = {
  * Registration (a.k.a. "Registration")
  */
 app.get('/generate-registration-options', async (req, res) => {
+  const _username = req.query.username as string;
+  loggedInUserId = uuidv4();
+  inMemoryUserDeviceDB[loggedInUserId] = {
+    id: loggedInUserId,
+    username: _username,
+    devices: [],
+    currentChallenge: undefined,
+  };
   const user = inMemoryUserDeviceDB[loggedInUserId];
 
   const {
@@ -120,6 +134,7 @@ app.get('/generate-registration-options', async (req, res) => {
      */
     username,
     devices,
+
   } = user;
 
   const opts: GenerateRegistrationOptionsOpts = {
@@ -134,6 +149,7 @@ app.get('/generate-registration-options', async (req, res) => {
      * the browser if it's asked to perform registration when one of these ID's already resides
      * on it.
      */
+    // @ts-ignore
     excludeCredentials: devices.map((dev) => ({
       id: dev.credentialID,
       type: 'public-key',
@@ -162,24 +178,31 @@ app.get('/generate-registration-options', async (req, res) => {
    */
   req.session.currentChallenge = options.challenge;
 
+  inMemoryUserDeviceDB[loggedInUserId].currentChallenge = options.challenge;
+  options.user.id = loggedInUserId;
+
   res.send(options);
 });
 
 app.post('/verify-registration', async (req, res) => {
-  const body: RegistrationResponseJSON = req.body;
 
-  const user = inMemoryUserDeviceDB[loggedInUserId];
+  const userId = req.body.id as string;
+  const registration = req.body.attestationResponse;
 
-  const expectedChallenge = req.session.currentChallenge;
+  const user = inMemoryUserDeviceDB[userId];
+  const expectedChallenge = user.currentChallenge;
 
   let verification: VerifiedRegistrationResponse;
+
+
   try {
-    const opts: VerifyRegistrationResponseOpts = {
-      response: body,
+    // @ts-ignore
+    const opts: any = {
+      response: registration,
       expectedChallenge: `${expectedChallenge}`,
-      expectedOrigin,
+      expectedOrigin: 'http://localhost:4200',
       expectedRPID: rpID,
-      requireUserVerification: false,
+      requireUserVerification: true,
     };
     verification = await verifyRegistrationResponse(opts);
   } catch (error) {
@@ -187,14 +210,11 @@ app.post('/verify-registration', async (req, res) => {
     console.error(_error);
     return res.status(400).send({ error: _error.message });
   }
-
   const { verified, registrationInfo } = verification;
-
   if (verified && registrationInfo) {
     const { credentialPublicKey, credentialID, counter } = registrationInfo;
-
-    const existingDevice = user.devices.find((device) => device.credentialID === credentialID);
-
+    // @ts-ignore
+    const existingDevice = user.devices.find(device => device.credentialID.equals(credentialID));
     if (!existingDevice) {
       /**
        * Add the returned device to the user's list of devices
@@ -203,14 +223,11 @@ app.post('/verify-registration', async (req, res) => {
         credentialPublicKey,
         credentialID,
         counter,
-        transports: body.response.transports,
+        transports: registration.transports,
       };
       user.devices.push(newDevice);
     }
   }
-
-  req.session.currentChallenge = undefined;
-
   res.send({ verified });
 });
 
@@ -218,8 +235,11 @@ app.post('/verify-registration', async (req, res) => {
  * Login (a.k.a. "Authentication")
  */
 app.get('/generate-authentication-options', async (req, res) => {
-  // You need to know the user by this point
-  const user = inMemoryUserDeviceDB[loggedInUserId];
+  const username = req.query.username as string;
+
+  // get user by username
+  const user = Object.values(inMemoryUserDeviceDB).find(user => user.username === username) as LoggedInUser;
+  const loggedInUserId = user.id;
 
   const opts: GenerateAuthenticationOptionsOpts = {
     timeout: 60000,
@@ -244,41 +264,48 @@ app.get('/generate-authentication-options', async (req, res) => {
    * after you verify an authenticator response.
    */
   req.session.currentChallenge = options.challenge;
+  inMemoryUserDeviceDB[loggedInUserId].currentChallenge = options.challenge;
+
 
   res.send(options);
 });
 
+
 app.post('/verify-authentication', async (req, res) => {
-  const body: AuthenticationResponseJSON = req.body;
-
-  const user = inMemoryUserDeviceDB[loggedInUserId];
-
-  const expectedChallenge = req.session.currentChallenge;
-
+  const body = req.body;
+  const username = body.username as string;
+  const authentication = body.assertionResponse;
+  // get user by username
+  const user = Object.values(inMemoryUserDeviceDB).find(user => user.username === username) as LoggedInUser;
+  // @ts-ignore
+  const expectedChallenge = user.currentChallenge;
   let dbAuthenticator;
+  const bodyCredIDBuffer = base64url.toBuffer(authentication.rawId);
   // "Query the DB" here for an authenticator matching `credentialID`
   for (const dev of user.devices) {
-    if (dev.credentialID === body.id) {
+    const credentialIDBuffer = Buffer.from(dev.credentialID, 'base64url');
+    if (credentialIDBuffer.equals(bodyCredIDBuffer)) {
       dbAuthenticator = dev;
       break;
     }
   }
-
   if (!dbAuthenticator) {
-    return res.status(400).send({
-      error: 'Authenticator is not registered with this site',
-    });
+    return res.status(400).send({ error: 'Authenticator is not registered with this site' });
   }
-
   let verification: VerifiedAuthenticationResponse;
+  console.log('LOGGING OUT USER');
+  console.log(user);
+
+  console.log('LOGGING OUT EXPECTED CHALLENGE');
+  console.log(expectedChallenge);
   try {
-    const opts: VerifyAuthenticationResponseOpts = {
-      response: body,
+    const opts: any = {
+      response: authentication,
       expectedChallenge: `${expectedChallenge}`,
-      expectedOrigin,
+      expectedOrigin: 'http://localhost:4200',
       expectedRPID: rpID,
       authenticator: dbAuthenticator,
-      requireUserVerification: false,
+      requireUserVerification: true,
     };
     verification = await verifyAuthenticationResponse(opts);
   } catch (error) {
@@ -286,17 +313,12 @@ app.post('/verify-authentication', async (req, res) => {
     console.error(_error);
     return res.status(400).send({ error: _error.message });
   }
-
   const { verified, authenticationInfo } = verification;
-
   if (verified) {
     // Update the authenticator's counter in the DB to the newest count in the authentication
     dbAuthenticator.counter = authenticationInfo.newCounter;
   }
-
-  req.session.currentChallenge = undefined;
-
-  res.send({ verified });
+  res.send({ verified,  user});
 });
 
 if (ENABLE_HTTPS) {
@@ -327,3 +349,18 @@ if (ENABLE_HTTPS) {
     console.log(`🚀 Server ready at ${expectedOrigin} (${host}:${port})`);
   });
 }
+
+app.get('/user', (req, res) => {
+  try {
+    const id = req.query.id as string;
+    const user = inMemoryUserDeviceDB[id];
+    console.log({user});
+    if(!user) throw new Error('User not found')
+    res.send(user);
+  } catch (error) {
+    console.log({error});
+    res.status(400).json(error);
+  }
+});
+
+
